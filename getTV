@@ -1,0 +1,302 @@
+#!/usr/bin/python
+# -*- coding: utf-8 -*-
+import os
+import sys
+import getopt
+import time
+import cPickle as pickle
+
+_AUTHOR_ = "potatobowl <max at elajt dot se>"
+_DATE_ = "20110207"
+
+# global settings
+# should probably be moved to function
+# and parsed from an rc file
+gettv_settings = {}
+# path to dir to store cached files
+gettv_settings["cache"] = "/home/jqs/.xmltv/getTV.cache"
+gettv_settings["xmltv"] = "/home/jqs/.xmltv/mtvg.xml"
+
+ENABLE_EP_NUM = True
+
+# because of possibility of large pickle's
+sys.setrecursionlimit(100000)
+
+def build_cache():
+	# these can drag down speed of the script
+	# and since we do not rebuild cache every run (probably)
+	# we import them here instead
+	import xml.dom.minidom
+	from xml.dom.minidom import Node
+	import re
+
+	# open and parse xmltv listing
+	xmltv = xml.dom.minidom.parse(gettv_settings["xmltv"])
+
+	# build channel index
+	chan_mapping = {}
+	for c_chan in xmltv.getElementsByTagName("channel"):
+		chan_id = c_chan.getAttribute("id").lower()
+		chan_name = c_chan.getElementsByTagName("display-name")[0].firstChild.data
+		chan_lang = c_chan.getElementsByTagName("display-name")[0].getAttribute("lang").upper()
+		chan_dict = {"id": chan_id, "name": chan_name, "lang": chan_lang}
+		chan_mapping[chan_id] = chan_dict
+
+	# parse programmes data
+	prog_mapping = {}
+	for c_prog in xmltv.getElementsByTagName("programme"):
+		# get time and convert to epoch time for easy comparison later
+		start_time = c_prog.getAttribute("start").split(" ", 1)[0]
+		stop_time = c_prog.getAttribute("stop").split(" ", 1)[0]
+		start_epoch = time.mktime(time.strptime(start_time, "%Y%m%d%H%M%S"))
+		stop_epoch = time.mktime(time.strptime(stop_time, "%Y%m%d%H%M%S"))
+
+		# get listing info
+		prog_title = c_prog.getElementsByTagName("title")[0].firstChild.data
+		prog_lang = c_prog.getElementsByTagName("title")[0].getAttribute("lang")
+		prog_chan = c_prog.getAttribute("channel").lower()
+		try:
+			prog_desc = c_prog.getElementsByTagName("desc")[0].firstChild.data
+		except IndexError:
+			prog_desc = "No description."
+			
+		try:
+			prog_date = c_prog.getElementsByTagName("date")[0].firstChild.data
+		except IndexError:
+			prog_date = False
+		try:
+			prog_cats = [k.firstChild.data.lower() for k in c_prog.getElementsByTagName("category")]
+		except IndexError:
+			prog_cats = False
+
+		# experimental. this seems to work good for listings from sweden, might
+		# need tweeking for other/different listings
+		ep_num = False
+		ep_total = False
+		ep_ses = False
+		if ENABLE_EP_NUM:
+			ep_num_tags = [k for k in c_prog.getElementsByTagName("episode-num") if k.getAttribute("system") == "onscreen"]
+			if len(ep_num_tags) == 1:
+				try:
+					ep_num = re.search("^[a-z\s]*([0-9]+)", ep_num_tags[0].firstChild.data, re.IGNORECASE).groups()[0]
+				except:
+					pass
+				try:
+					ep_total = re.search("^[a-z\s]*[0-9]+\s+[a-z]{1,3}\s+([0-9]+)", ep_num_tags[0].firstChild.data, re.IGNORECASE).groups()[0]
+				except:
+					pass
+				try:
+					ep_ses = re.search("song\s+([0-9]+\s*$)", ep_num_tags[0].firstChild.data, re.IGNORECASE).groups()[0]
+				except:
+					pass
+		
+		# save parsed data
+		# we save parsed programmes in a hiarchy
+		# that will speed up finding programmes for certain dates
+		# and times and channels later.
+		start_date = start_time[:8]
+		start_hour = start_time[8:10]
+		if start_date not in prog_mapping.keys():
+			prog_mapping[start_date] = {}
+		if start_hour not in prog_mapping[start_date].keys():
+			prog_mapping[start_date][start_hour] = {}
+		if prog_chan not in prog_mapping[start_date][start_hour].keys():
+			prog_mapping[start_date][start_hour][prog_chan] = []
+
+
+		prog_dict = {
+			"start": start_epoch, \
+			"stop": stop_epoch, \
+			"title": prog_title, \
+			"lang": prog_lang, \
+			"chanid": prog_chan, \
+			"desc": prog_desc, \
+			"date": prog_date, \
+			"cats": prog_cats, \
+			"epnum": ep_num, \
+			"eptotal": ep_total, \
+			"epses": ep_ses}
+
+		prog_mapping[start_date][start_hour][prog_chan].append(prog_dict)
+
+	# save parsed data into pickled cache files
+	# each file will contain listings for one day,
+	# so there will be multiple cache files, and
+	# one file for the channel listing.
+
+	# dump channels
+	chan_cache_fp = open(os.path.join(gettv_settings["cache"], "channels"), "wb")
+	pickle.dump(chan_mapping, chan_cache_fp)
+	chan_cache_fp.close()
+
+	# dump tv programmes
+	for c_date in prog_mapping.keys():
+		day_cache_fp = open(os.path.join(gettv_settings["cache"], c_date), "wb")
+		pickle.dump(prog_mapping[c_date], day_cache_fp)
+		day_cache_fp.close()
+
+def get_programmes(epoch_time, num_following=0):
+	start_date = time.strftime("%Y%m%d", time.localtime(epoch_time))
+	start_hour = time.strftime("%H", time.localtime(epoch_time))
+
+	if not os.path.isfile(os.path.join(gettv_settings["cache"], start_date)):
+		print "No cache file for %s. Possible reasons:" % start_date
+		print "* No cache build for this date. Try rebuilding (-r) the cache."
+		print "* No tv listings for this day."
+		sys.exit(0)
+
+	# open cache
+	cache_fp = open(os.path.join(gettv_settings["cache"], start_date), "rb")
+	tv_listing = pickle.load(cache_fp)
+	cache_fp.close()
+	channel_fp = open(os.path.join(gettv_settings["cache"], "channels"), "rb")
+	channel_listing = pickle.load(channel_fp)
+	channel_fp.close()
+
+	# get shows
+	return_listings = []
+	return_channels = {}
+	for c_hour in tv_listing.keys():
+		for c_chan in tv_listing[c_hour].keys():
+			for this_prog in tv_listing[c_hour][c_chan]:
+				if this_prog["start"] <= epoch_time <= this_prog["stop"]:
+					return_listings.append(this_prog)
+					return_channels[this_prog["chanid"]] = channel_listing[this_prog["chanid"]]
+					break
+
+	return (return_channels, return_listings)
+
+def usage():
+	txt_usage = """
+	gettv - version: %s (%s)
+	%s
+
+	Usage: gettv [--rebuild-cache/-r] [-n/--nodesc] [--time=HHMM/-t HHMM] [--day=<1-31>/-d <1-31>] [--month=<1-12>/-m <1-12>] [--year=YY/-y YY]
+
+	-r
+	--rebuild-cache
+		Forces a rebuild of the cache used by the script.
+	-n
+	--nodesc
+		Supress the description in the output.
+
+	-t HHMM
+	--time=HHMM
+		Shows the tv listing for programmes for the certain time.
+		Defaults to the current time (%s).
+
+	-d <1-31>
+	--day=<1-31>
+		Shows the listing on the specified day. Should/can be combined with other
+		date switches for more specific output.
+		Defaults to the current date (%s).
+
+	-m <1-12>
+	--month=<1-12>
+		Shows listing on the specified month.
+		Defaults to the current month (%s).
+
+	-y YY
+	--year=YY
+		Specifies the listing year with two digits.
+		Defaults to the current years digits (%s).
+	""" % (_VERSION_, _DATE_, _AUTHOR_, time.strftime("%H%M"), time.strftime("%d"), time.strftime("%m"), time.strftime("%y"))
+
+	print txt_usage
+
+
+if __name__ == "__main__":
+	short_switches = "rnt:d:m:y:"
+	long_switches = ["rebuild-cache", "nodesc", "time", "day", "month", "year"]
+
+	show_num_programmes = 0
+	this_year = time.strftime("%Y")
+	this_month = time.strftime("%m")
+	this_day = time.strftime("%d")
+	this_time = time.strftime("%H%M%S")
+	show_desc = True
+
+	# process input arguments
+	try:
+		opts, args = getopt.getopt(sys.argv[1:], short_switches, long_switches)
+	except getopt.GetoptError, err:
+		print str(err)
+		usage()
+		sys.exit(2)
+	else:
+		for c_arg, c_val in opts:
+			if c_arg in ("-r", "--rebuild-cache"):
+				build_cache()
+				sys.exit(0)
+			if c_arg in ("-n", "--nodesc"):
+				show_desc = False
+			elif c_arg in ("-n", "--programmes"):
+				if int(c_val) >= 0:
+					show_num_programmes = int(c_val)
+				else:
+					print "Error using -n/--programmes switch."
+					sys.exit(2)
+			elif c_arg in ("-t", "--time"):
+				if len(c_val) != 4:
+					print "Error using -t/--time switch"
+					sys.exit(2)
+				if 0 <= int(c_val[:2]) <= 23:
+					this_time = "%s%s00" % (c_val[:2], this_time[2:])
+				else:
+					print "Hour switch is not valid."
+					sys.exit(2)
+				if 0 <= int(c_val[2:]) <= 59:
+					this_time = "%s%s00" % (this_time[:2], c_val[2:])
+				else:
+					print "Minute switch is not valid."
+					sys.exit(2)
+			elif c_arg in ("-d", "--day"):
+				if 1 <= int(c_val) <= 31:
+					this_day = str(int(c_val)).rjust(2, "0")
+				else:
+					print "Day switch is not valid."
+					sys.exit(2)
+			elif c_arg in ("-m", "--month"):
+				if 1 <= int(c_val) <= 12:
+					this_month = str(int(c_val)).rjust(2, "0")
+				else:
+					print "Month switch is not valid."
+					sys.exit(2)
+			elif c_arg in ("-y", "--year"):
+				if len(c_val) != 2:
+					print "Year switch is not valid."
+					sys.exit(2)
+				this_year = "20" + str(int(c_val)).rjust(2, "0")
+
+	# get the epoch of the selected date
+	timestamp = "%s%s%s%s" % (this_year, this_month, this_day, this_time)
+	t_struct = time.strptime(timestamp, "%Y%m%d%H%M%S")
+	t_epoch = time.mktime(t_struct)
+
+	progs_and_chans = get_programmes(t_epoch, show_num_programmes)
+	programmes = progs_and_chans[1]
+	channels = progs_and_chans[0]
+	for c_prog in programmes:
+		c_chan = channels[c_prog["chanid"]]["name"]
+		c_proc = int(round(100 * (t_epoch - c_prog["start"]) / (c_prog["stop"] - c_prog["start"])))
+
+		print "%s %s" % (c_prog["title"], "("+c_prog["date"]+")" if c_prog["date"] else "")
+	
+		chan_line = "* %s" % (c_chan,)
+		if c_prog["epnum"]:
+			chan_line = "%s / Episode %s" % (chan_line, c_prog["epnum"])
+			if c_prog["eptotal"]:
+				chan_line = "%s/%s" % (chan_line, c_prog["eptotal"])
+			if c_prog["epses"]:
+				chan_line = "%s / Season %s" % (chan_line, c_prog["epses"])
+		print chan_line
+		
+		if len(c_prog["cats"]) > 0:
+			print "* %s" % ("/".join(c_prog["cats"]),)
+
+		if show_desc:
+			print "* %s" % (c_prog["desc"],)
+
+		progress_bar = ("=" * (c_proc / 2)).ljust(50, " ")
+		print "%s |%s| %s" % (time.strftime("%H:%M", time.localtime(c_prog["start"])), progress_bar, time.strftime("%H:%M", time.localtime(c_prog["stop"])))
+		print ""
